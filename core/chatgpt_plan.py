@@ -19,6 +19,10 @@ from core.session import BrowserSession, close_browser_session
 logger = logging.getLogger(__name__)
 
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
+WHAM_USAGE_PATH = "/backend-api/wham/usage"
+# wham/usage 是 Codex 后端接口，官方客户端是 Codex CLI；用浏览器 UA 打特征
+# 不符，实测以 Codex CLI 的 UA 查询（与 any-auto-register 的 status_probe 一致）。
+CODEX_USAGE_USER_AGENT = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
 
 
 def now_iso() -> str:
@@ -377,6 +381,105 @@ def _retry_wait_seconds(resp: Any, base_delay: float, attempt: int) -> float:
     return max(0.0, min(30.0, base_delay * attempt))
 
 
+def _usage_headers(env: BrowserSession, token: str, claims: dict | None = None) -> dict[str, str]:
+    """生成 Codex 窗口额度（wham/usage）查询头。
+
+    与套餐查询共用同一会话与 AT，但目标路径和 UA 按 Codex 客户端的真实
+    形状走：accounts/check 是网页端接口用浏览器 UA，wham 是 Codex 后端
+    接口用 Codex CLI 的 UA，混用会被风控按特征不符处理。
+    """
+    headers = _common_headers(env, token, claims)
+    headers["x-openai-target-path"] = WHAM_USAGE_PATH
+    headers["x-openai-target-route"] = WHAM_USAGE_PATH
+    for key in [k for k in headers if k.lower() == "user-agent"]:
+        headers.pop(key)
+    headers["User-Agent"] = CODEX_USAGE_USER_AGENT
+    return headers
+
+
+def _parse_usage_window(window: Any) -> dict | None:
+    if not isinstance(window, dict):
+        return None
+    out = {}
+    for key in ("used_percent", "limit_window_seconds", "reset_after_seconds", "reset_at"):
+        value = window.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[key] = value
+    return out or None
+
+
+def parse_wham_usage(data: dict) -> dict:
+    """解析 /backend-api/wham/usage 响应，只保留窗口额度与套餐字段。"""
+    rate_limit = data.get("rate_limit") if isinstance(data.get("rate_limit"), dict) else {}
+    result = {
+        "plan_type": data.get("plan_type"),
+        "rate_limit_allowed": rate_limit.get("allowed"),
+        "rate_limit_reached": rate_limit.get("limit_reached"),
+        "primary_window": _parse_usage_window(rate_limit.get("primary_window")),
+        "secondary_window": _parse_usage_window(rate_limit.get("secondary_window")),
+    }
+    review = data.get("code_review_rate_limit")
+    if isinstance(review, dict):
+        result["code_review_primary_window"] = _parse_usage_window(review.get("primary_window"))
+    extras = []
+    additional = data.get("additional_rate_limits")
+    for item in additional if isinstance(additional, list) else []:
+        if not isinstance(item, dict):
+            continue
+        item_limit = item.get("rate_limit") if isinstance(item.get("rate_limit"), dict) else {}
+        extras.append({
+            "limit_name": item.get("limit_name"),
+            "primary_window": _parse_usage_window(item_limit.get("primary_window")),
+            "secondary_window": _parse_usage_window(item_limit.get("secondary_window")),
+        })
+    if extras:
+        result["additional_rate_limits"] = extras
+    return result
+
+
+def check_codex_usage(
+    env: BrowserSession,
+    token: str,
+    claims: dict | None = None,
+    *,
+    timeout: float = 15.0,
+) -> dict:
+    """在已有会话上顺带查 Codex 窗口额度；失败只记结果，绝不影响套餐查询。"""
+    base: dict[str, Any] = {"checked_at": now_iso(), "source": "wham_usage"}
+    http_status: int | None = None
+    try:
+        resp = env.get(
+            f"https://chatgpt.com{WHAM_USAGE_PATH}",
+            headers=_usage_headers(env, token, claims),
+            allow_redirects=False,
+            timeout=timeout,
+        )
+        http_status = int(resp.status_code)
+        base["http_status"] = http_status
+        if not (200 <= http_status < 300):
+            base.update({"ok": False, "error": f"HTTP {http_status}"})
+            return base
+        try:
+            data = resp.json()
+        except Exception:
+            data = json.loads(resp.text or "")
+        if not isinstance(data, dict):
+            base.update({"ok": False, "error": "响应不是 JSON 对象"})
+            return base
+        base.update({"ok": True})
+        base.update(parse_wham_usage(data))
+        return base
+    except Exception as exc:
+        logger.debug("Codex 窗口额度查询失败: %s: %s", type(exc).__name__, exc)
+        base.update({"ok": False, "http_status": http_status, "error": f"{type(exc).__name__}: {exc}"})
+        return base
+    finally:
+        # wham 的可重试状态码同样会触发 BrowserSession 熔断；借用会话时
+        # 不能把熔断留给调用方，成功或普通业务错误则不动会话状态。
+        if http_status is not None and _retryable_plan_error(http_status):
+            _clear_plan_circuit(env)
+
+
 def check_account_plan(
     token: str,
     *,
@@ -505,6 +608,9 @@ def check_account_plan(
                         }
                     else:
                         parsed = parse_accounts_check(data, token=token)
+                        parsed["codex_usage"] = check_codex_usage(
+                            env, token, claims, timeout=timeout_seconds,
+                        )
                         parsed["http_status"] = http_status
                         parsed["attempt_count"] = attempt
                         parsed["max_attempts"] = attempts
