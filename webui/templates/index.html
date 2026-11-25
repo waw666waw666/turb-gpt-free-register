@@ -3543,6 +3543,24 @@ function _promoStackHtml(baseText, baseClass, summaries, title, detailBtn = '') 
   const lines = summaries.map(item => `<span class="pill status-success" title="${esc(item)}">${esc(item)}</span>`).join('');
   return `<div class="plan-promo-stack"><div class="plan-promo-head">${base}${detailBtn}</div>${lines}</div>`;
 }
+function _codexUsageLines(r) {
+  const u = (r.codex_usage && typeof r.codex_usage === 'object') ? r.codex_usage : null;
+  if (!u || u.ok !== true) return [];
+  const label = (w, fallback) => {
+    const secs = Number(w && w.limit_window_seconds);
+    if (secs === 18000) return '5h';
+    if (secs === 604800) return '周';
+    return fallback;
+  };
+  const lines = [];
+  const push = (w, fallback) => {
+    if (!w || typeof w.used_percent !== 'number') return;
+    lines.push(`Codex ${label(w, fallback)} ${w.used_percent}%`);
+  };
+  push(u.primary_window, '主窗口');
+  push(u.secondary_window, '副窗口');
+  return lines;
+}
 function _planCell(r) {
   const ok = r.plan_check_ok;
   const err = r.plan_check_error || '';
@@ -3582,7 +3600,7 @@ function _planCell(r) {
     const t = promoSummaries.length ? `${title}；可用套餐优惠：${promoSummaries.join('；')}` : title;
     const keys = Object.keys(campaigns);
     const detailBtn = keys.length ? `<button type="button" class="promo-detail-btn" data-promo-details="${esc(JSON.stringify(campaigns))}">详情(${keys.length})</button>` : '';
-    return _promoStackHtml('free', cls, promoSummaries, t, detailBtn);
+    return _promoStackHtml('free', cls, [...promoSummaries, ..._codexUsageLines(r)], t, detailBtn);
   }
 
   const cls = 'status-success';
@@ -3601,7 +3619,7 @@ function _planCell(r) {
   if (r.plan_renews_at) detail.push(`续费时间: ${r.plan_renews_at}`);
   if (r.discount_expires_at) detail.push(`折扣结束: ${r.discount_expires_at}`);
   if (r.discount_promo_campaign_id) detail.push(`优惠: ${r.discount_promo_campaign_id}`);
-  return _promoStackHtml(text, cls, promoSummaries, detail.join('；'));
+  return _promoStackHtml(text, cls, [...promoSummaries, ..._codexUsageLines(r)], detail.join('；'));
 }
 function _planAction(r) {
   if (['queued','running'].includes(r.plan_check_status)) {
